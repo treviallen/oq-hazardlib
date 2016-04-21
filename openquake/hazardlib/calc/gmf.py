@@ -25,14 +25,22 @@ import collections
 import numpy
 import scipy.stats
 
+from openquake.baselib.general import groupby2
 from openquake.baselib.python3compat import zip
 from openquake.hazardlib.const import StdDev
 from openquake.hazardlib.calc import filters
 from openquake.hazardlib.gsim.base import ContextMaker
 from openquake.hazardlib.imt import from_string
+from openquake.hazardlib import site
 
+U8 = numpy.uint8
+U16 = numpy.uint16
 U32 = numpy.uint32
 F32 = numpy.float32
+
+U8SIZE = 2 ** 8
+U16SIZE = 2 ** 16
+U32SIZE = 2 ** 32
 
 
 def gmv_dt(imts):
@@ -219,6 +227,177 @@ class GmfComputer(object):
             for r, rlz in enumerate(rlz_ids):
                 ddic[rlz] = self._compute(seed + r, gsim, multiplicity)
         return ddic
+
+# #################################################################### #
+
+
+class GmfExtractor(object):
+    """
+    A class used to filter the GMF array. Here is an example:
+
+    >>> extract = GmfExtractor(range(5), ['PGA', 'SA(0.1)'])
+    >>> gmfa = numpy.array([
+    ...     (0, 1, 0, 42, 0.030),
+    ...     (0, 1, 0, 43, 0.031),
+    ...     (0, 2, 0, 43, 0.032),
+    ...     (0, 2, 0, 42, 0.033),
+    ...     (2, 1, 0, 42, 0.034),
+    ...     (2, 1, 1, 43, 0.035),
+    ...     (2, 1, 1, 44, 0.036),
+    ...     ], extract.gmf_dt)
+    >>> print(extract(gmfa, sid=0, rlzi=1, imti=0)['gmv'])
+    [ 0.03   0.031]
+    """
+    gmv_dt = numpy.dtype([('sid', U16), ('rlzi', U16), ('imti', U8),
+                          ('eid', U32), ('gmv', F32)])
+    KNOWN_NAMES = set(['sid', 'rlzi', 'imti', 'eid'])
+
+    def __init__(self, sitecol, imts, rlzs_assoc=None, min_iml=None):
+        if len(sitecol) > U16SIZE:
+            raise ValueError(
+                'the number of sites is %d, the upper limit is %d' %
+                (len(sitecol), U16SIZE))
+        if len(imts) > U8SIZE:
+            raise ValueError(
+                'the number of IMTs is %d, the upper limit is %d' %
+                (len(imts), U8SIZE))
+        if rlzs_assoc and len(rlzs_assoc.realizations) > U16SIZE:
+            raise ValueError(
+                'the number of realizations is %d, the upper limit is %d' %
+                (len(rlzs_assoc.realizations), U16SIZE))
+        self.sitecol = sitecol
+        self.imts = imts
+        self.imt2idx = {imt: i for i, imt in enumerate(imts)}
+        self.rlzs_assoc = rlzs_assoc
+        self.min_iml = numpy.zeros(len(imts), F32)
+        if min_iml:
+            for imt, cutoff in min_iml.items():
+                self.min_iml[self.imt2idx[imt]] = cutoff
+
+    def __call__(self, array, **kw):
+        for name, value in kw.items():
+            if name not in self.KNOWN_NAMES:
+                raise ValueError('%s is not one of %s' %
+                                 (name, self.KNOWN_NAMES))
+            array = array[array[name] == value]
+        return array
+
+    def by_rlz(self, array):
+        rlzs = self.rlzs_assoc.realizations
+        return {rlzs[i]: data for i, data in groupby2(
+            array, 'rlzi', ('eid', 'gmv'))}
+
+
+class Computer(object):
+    def __init__(self, rupture, extractor,
+                 truncation_level=None, correlation_model=None):
+        self.extractor = extractor
+        self.rupture = rupture
+        self.sites = site.FilteredSiteCollection(
+            rupture.indices, extractor.sitecol)
+        self.rlzs_by_gsim = extractor.rlzs_assoc.get_rlzs_by_gsim(
+            rupture.trt_id)
+        self.truncation_level = truncation_level
+        self.correlation_model = correlation_model
+        self.ctx = ContextMaker(sorted(self.rlzs_by_gsim)).make_contexts(
+            self.sites, rupture.rupture)
+        self.imts = [from_string(imt) for imt in extractor.imts]
+
+    def _compute(self, seed, gsim, realizations):
+        # the method doing the real stuff; use compute instead
+        if seed is not None:
+            numpy.random.seed(seed)
+        imts = self.imts
+        result = numpy.zeros((len(imts), len(self.sites), realizations))
+        imt2idx = self.extractor.imt2idx
+        sctx, rctx, dctx = self.ctx
+
+        if self.truncation_level == 0:
+            assert self.correlation_model is None
+            for imt in imts:
+                mean, _stddevs = gsim.get_mean_and_stddevs(
+                    sctx, rctx, dctx, imt, stddev_types=[])
+                mean = gsim.to_imt_unit_values(mean)
+                mean.shape += (1, )
+                mean = mean.repeat(realizations, axis=1)
+                result[imt2idx[str(imt)]] = mean
+            return result
+        elif self.truncation_level is None:
+            distribution = scipy.stats.norm()
+        else:
+            assert self.truncation_level > 0
+            distribution = scipy.stats.truncnorm(
+                - self.truncation_level, self.truncation_level)
+
+        for imt in imts:
+            if gsim.DEFINED_FOR_STANDARD_DEVIATION_TYPES == \
+               set([StdDev.TOTAL]):
+                # If the GSIM provides only total standard deviation, we need
+                # to compute mean and total standard deviation at the sites
+                # of interest.
+                # In this case, we also assume no correlation model is used.
+                if self.correlation_model:
+                    raise CorrelationButNoInterIntraStdDevs(
+                        self.correlation_model, gsim)
+
+                mean, [stddev_total] = gsim.get_mean_and_stddevs(
+                    sctx, rctx, dctx, imt, [StdDev.TOTAL])
+                stddev_total = stddev_total.reshape(stddev_total.shape + (1, ))
+                mean = mean.reshape(mean.shape + (1, ))
+
+                total_residual = stddev_total * distribution.rvs(
+                    size=(len(self.sites), realizations))
+                gmf = gsim.to_imt_unit_values(mean + total_residual)
+            else:
+                mean, [stddev_inter, stddev_intra] = gsim.get_mean_and_stddevs(
+                    sctx, rctx, dctx, imt,
+                    [StdDev.INTER_EVENT, StdDev.INTRA_EVENT])
+                stddev_intra = stddev_intra.reshape(stddev_intra.shape + (1, ))
+                stddev_inter = stddev_inter.reshape(stddev_inter.shape + (1, ))
+                mean = mean.reshape(mean.shape + (1, ))
+
+                intra_residual = stddev_intra * distribution.rvs(
+                    size=(len(self.sites), realizations))
+
+                if self.correlation_model is not None:
+                    ir = self.correlation_model.apply_correlation(
+                        self.sites, imt, intra_residual)
+                    # this fixes a mysterious bug: ir[row] is actually
+                    # a matrix of shape (E, 1) and not a vector of size E
+                    intra_residual = numpy.zeros(ir.shape)
+                    for i, val in numpy.ndenumerate(ir):
+                        intra_residual[i] = val
+
+                inter_residual = stddev_inter * distribution.rvs(
+                    size=realizations)
+
+                gmf = gsim.to_imt_unit_values(
+                    mean + intra_residual + inter_residual)
+
+            result[imt2idx[str(imt)]] = gmf
+
+        return result
+
+    def compute(self):
+        """
+        Compute the ground motion fields generated by the underlying rupture.
+        :returns:
+            a numpy array of type gmv_dt
+        """
+        rupture = self.rupture
+        records = []
+        min_iml = self.extractor.min_iml
+        for gsim, rlzs in self.rlzs_by_gsim.items():
+            for r, rlz in enumerate(rlzs):
+                gmf_by_imt = self._compute(rupture.rupture.seed + r, gsim,
+                                           rupture.multiplicity)
+                for imti, array in enumerate(gmf_by_imt):
+                    for sid, gmvs in zip(rupture.indices, array):
+                        for gmv, eid in zip(gmvs, rupture.eids):
+                            if gmv >= min_iml[imti]:
+                                records.append(
+                                    (sid, rlz.ordinal, imti, eid, gmv))
+        return numpy.array(records, self.extractor.gmv_dt)
 
 
 # this is not used in the engine; it is still useful for usage in IPython
