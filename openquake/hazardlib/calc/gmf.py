@@ -235,7 +235,7 @@ class GmfExtractor(object):
     """
     A class used to filter the GMF array. Here is an example:
 
-    >>> extract = GmfExtractor(range(5), ['PGA', 'SA(0.1)'])
+    >>> extractor = GmfExtractor(range(5), ['PGA', 'SA(0.1)'])
     >>> gmfa = numpy.array([
     ...     (0, 1, 0, 42, 0.030),
     ...     (0, 1, 0, 43, 0.031),
@@ -244,7 +244,7 @@ class GmfExtractor(object):
     ...     (2, 1, 0, 42, 0.034),
     ...     (2, 1, 1, 43, 0.035),
     ...     (2, 1, 1, 44, 0.036),
-    ...     ], extract.gmf_dt)
+    ...     ], extractor.gmv_dt)
     >>> print(extract(gmfa, sid=0, rlzi=1, imti=0)['gmv'])
     [ 0.03   0.031]
     """
