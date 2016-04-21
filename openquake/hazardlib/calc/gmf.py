@@ -328,11 +328,10 @@ class Computer(object):
         self.rupture = rupture
         self.sites = site.FilteredSiteCollection(
             rupture.indices, extractor.sitecol)
-        self.rlzs_by_gsim = extractor.rlzs_assoc.get_rlzs_by_gsim(
-            rupture.trt_id)
+        gsims = extractor.rlzs_assoc.gsims_by_trt_id[rupture.trt_id]
         self.truncation_level = truncation_level
         self.correlation_model = correlation_model
-        self.ctx = ContextMaker(sorted(self.rlzs_by_gsim)).make_contexts(
+        self.ctx = ContextMaker(gsims).make_contexts(
             self.sites, rupture.rupture)
         self.imts = [from_string(imt) for imt in extractor.imts]
 
@@ -420,7 +419,7 @@ class Computer(object):
         rupture = self.rupture
         records = []
         min_iml = self.extractor.imtdict2array(min_iml)
-        for gsim, rlzs in self.rlzs_by_gsim.items():
+        for (trt_id, gsim), rlzs in self.extractor.rlzs_assoc.items():
             for r, rlz in enumerate(rlzs):
                 gmf_by_imt = self._compute(
                     rupture.rupture.seed + r, gsim, rupture.multiplicity)
